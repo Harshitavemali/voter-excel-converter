@@ -58,19 +58,34 @@ with st.sidebar:
 
 TELUGU_NOISE_PATTERNS = [
     r'^Photo$', r'^Available$', r'^Available Available$',
-    r'^వయస్సు లెక్కింపు తేదీ', r'^ప్రచురణ తేదీ', r'^మొత్తం పేజీలు',
+    r'^వయస్సు లెక్కింపు తేదీ', r'^ప్రచురణ తేదీ',
     r'^శాసనసభ నియోజకవర్గం సంఖ్య మరియు పేరు', r'^విభాగం సంఖ్య మరియు పేరు',
     r'^భాగం సంఖ్య', r'^\d{2}-\d{2}-\d{4}$', r'^\|$',
 ]
 TELUGU_NOISE_RE = re.compile('|'.join(TELUGU_NOISE_PATTERNS))
 
+# "మొత్తం పేజీలు ... పేజీ N" marks a genuine page boundary in the source PDF.
+# We use these to verify records/IDs counts stay balanced per page, so a
+# mismatch or a merged/skipped record on one page can't silently cascade
+# and shift every serial number on every page after it (as it would with a
+# single document-wide positional match).
+TELUGU_PAGE_BOUNDARY_RE = re.compile(r'^మొత్తం పేజీలు')
+
 TELUGU_ID_RE = re.compile(r'([A-Z]{2,4})\s?(\d{6,7})')
 
-# Matches one full record: name ... relation-label ... relation-name ... house ... age ... gender-word
+# Matches one full record: name ... [relation-label ... relation-name] ... house ... age ... gender-word
+# The relation group is OPTIONAL: the source PDF occasionally drops that field
+# entirely for a record. Without this, such a record fails to match on its own
+# and the regex swallows it into the NEXT record's match instead - merging two
+# records into one and throwing off every serial number after it on that page.
+# The name group also stops at the next "ఓటరు పేరు" marker (a second name
+# occasionally appears before the first record's own details, another
+# page-break artifact) - without this boundary, a record with no immediately
+# following field would swallow the next record's name text too.
 # Separators use [:|\s]* (not a fixed single ':') because OCR/copy sometimes doubles punctuation.
 TELUGU_RECORD_RE = re.compile(
-    r'ఓటరు\s*పేరు\s*[:|\s]*(.+?)\s*'
-    r'(తండ్రి\s*పేరు|భర్త\s*పేరు)\s*[:|\s]*(.+?)\s*'
+    r'ఓటరు\s*పేరు\s*[:|\s]*((?:(?!ఓటరు\s*పేరు).)+?)\s*'
+    r'(?:(తండ్రి\s*పేరు|భర్త\s*పేరు)\s*[:|\s]*((?:(?!ఓటరు\s*పేరు).)+?)\s*)?'
     r'ఇంటి\s*సంఖ్య\s*[:|\s]*(.+?)\s*'
     r'వయస్సు\s*[:|\s]*(\d{1,6})\s*'
     r'లింగము\s*[:|\s]*(పురుషులు|స్త్రీలు)'
@@ -85,10 +100,26 @@ def clean_text_telugu(text):
     for l in lines:
         if not l:
             continue
+        if TELUGU_PAGE_BOUNDARY_RE.match(l):
+            out.append('\x00PAGE_BOUNDARY\x00')
+            continue
         if TELUGU_NOISE_RE.match(l):
             continue
         out.append(l)
     return out
+
+def split_into_telugu_pages(lines):
+    pages = []
+    current = []
+    for l in lines:
+        if l == '\x00PAGE_BOUNDARY\x00':
+            pages.append(current)
+            current = []
+            continue
+        current.append(l)
+    if current:
+        pages.append(current)
+    return pages
 
 def _dedupe_telugu_age(raw):
     # OCR/copy sometimes doubles the age digits, e.g. "4545" -> "45", "7474" -> "74"
@@ -112,67 +143,106 @@ def _clean_telugu_name_field(raw):
     cleaned = _TELUGU_STRAY_NUMBER_RE.sub('', cleaned)
     return re.sub(r'\s+', ' ', cleaned).strip(' |')
 
+def _extract_telugu_serials(page_lines):
+    """Extract printed serial numbers from a page's lines, in appearance order.
+    A line counts as serial-bearing only if, after removing any Voter ID tokens,
+    everything left on it is purely one or more short digit groups (no Telugu
+    text, no age/house labels) - e.g. '1', '4 ATM0261701', or 'ATM2065589 11
+    ATM1559012 12 ATM0261644'. This deliberately excludes age values (which sit
+    on lines with 'వయస్సు') and house numbers (which contain hyphens/slashes).
+    """
+    serials = []
+    for line in page_lines:
+        stripped = TELUGU_ID_RE.sub(' ', line).strip()
+        if not stripped:
+            continue
+        if re.fullmatch(r'(\d{1,4}\s*)+', stripped):
+            serials.extend(re.findall(r'\d{1,4}', stripped))
+    return [int(s) for s in serials]
+
 def parse_voter_data_telugu(text):
     lines = clean_text_telugu(text)
-    joined = re.sub(r'\s+', ' ', ' '.join(lines))
-
-    ids = [m.group(1) + m.group(2) for m in TELUGU_ID_RE.finditer(joined)]
-    records = list(TELUGU_RECORD_RE.finditer(joined))
+    pages = split_into_telugu_pages(lines)
 
     voters = []
     seen_ids = set()
-    for idx, m in enumerate(records):
-        name_raw = re.sub(r'\s+', ' ', m.group(1)).strip(' |')
-        name = _clean_telugu_name_field(name_raw)
-        relation_type = TELUGU_RELATION_LABEL_MAP.get(m.group(2).strip(), '')
-        relation_raw = re.sub(r'\s+', ' ', m.group(3)).strip(' |')
-        relation_name = _clean_telugu_name_field(relation_raw)
-        house_raw = re.sub(r'\s+', ' ', m.group(4)).strip(' |')
-        house_match = re.match(r'[\d][\d./\-]*', house_raw.lstrip())
-        if not house_match:
-            house_match = re.search(r'[\d][\d./\-]*', house_raw)
-        house = house_match.group(0) if house_match else house_raw
-        age = _dedupe_telugu_age(m.group(5))
-        gender = TELUGU_GENDER_MAP.get(m.group(6), '')
+    last_known_serial = 0
+    for page_lines in pages:
+        page_joined = re.sub(r'\s+', ' ', ' '.join(page_lines))
+        ids = [m.group(1) + m.group(2) for m in TELUGU_ID_RE.finditer(page_joined)]
+        records = list(TELUGU_RECORD_RE.finditer(page_joined))
+        printed_serials = _extract_telugu_serials(page_lines)
+        page_count_mismatch = (len(records) != len(ids))
+        serials_count_mismatch = (len(records) != len(printed_serials))
 
-        voter_id = ids[idx] if idx < len(ids) else ''
-        needs_review = False
-        if not voter_id:
-            needs_review = True
-        elif voter_id in seen_ids:
-            needs_review = True
-        else:
-            seen_ids.add(voter_id)
-        # If cleanup had to strip something, or the raw field looked longer than
-        # the cleaned field by a lot, flag it so it's easy to spot-check.
-        if name_raw != name or relation_raw != relation_name:
-            needs_review = True
+        for idx, m in enumerate(records):
+            serial_inferred = False
+            if idx < len(printed_serials) and not serials_count_mismatch:
+                sno = printed_serials[idx]
+                last_known_serial = sno
+            else:
+                sno = last_known_serial + 1
+                last_known_serial = sno
+                serial_inferred = True
 
-        voters.append({
-            'S.No': idx + 1,
-            'Voter_ID': voter_id,
-            'Voter_Name': name,
-            'Father_Husband_Name': relation_name,
-            'Relation_Type': relation_type,
-            'House_No': house,
-            'Age': age,
-            'Gender': gender,
-            'Needs_Review': 'Yes' if needs_review else ''
-        })
+            name_raw = re.sub(r'\s+', ' ', m.group(1)).strip(' |')
+            name = _clean_telugu_name_field(name_raw)
+            relation_missing = m.group(2) is None
+            relation_type = TELUGU_RELATION_LABEL_MAP.get((m.group(2) or '').strip(), '')
+            relation_raw = re.sub(r'\s+', ' ', m.group(3) or '').strip(' |')
+            relation_name = _clean_telugu_name_field(relation_raw)
+            house_raw = re.sub(r'\s+', ' ', m.group(4)).strip(' |')
+            house_match = re.match(r'[\d][\d./\-]*', house_raw.lstrip())
+            if not house_match:
+                house_match = re.search(r'[\d][\d./\-]*', house_raw)
+            house = house_match.group(0) if house_match else house_raw
+            age = _dedupe_telugu_age(m.group(5))
+            gender = TELUGU_GENDER_MAP.get(m.group(6), '')
+
+            voter_id = ids[idx] if idx < len(ids) else ''
+            needs_review = page_count_mismatch or serial_inferred or relation_missing
+            if not voter_id:
+                needs_review = True
+            elif voter_id in seen_ids:
+                needs_review = True
+            else:
+                seen_ids.add(voter_id)
+            # If cleanup had to strip something, flag it so it's easy to spot-check.
+            if name_raw != name or relation_raw != relation_name:
+                needs_review = True
+
+            voters.append({
+                'S.No': sno,
+                'Voter_ID': voter_id,
+                'Voter_Name': name,
+                'Father_Husband_Name': relation_name,
+                'Relation_Type': relation_type,
+                'House_No': house,
+                'Age': age,
+                'Gender': gender,
+                'Needs_Review': 'Yes' if needs_review else ''
+            })
 
     return voters
 
 ENGLISH_NOISE_PATTERNS = [
     r'^Photo$', r'^photo$', r'^Available$', r'^PhotO$', r'^photO$',
-    r'^Age as on', r'^Date of Publication', r'^Total Pages',
-    r'^Assembly Constituency No and Name', r'^Section No and Name',
-    r'^Part No\.', r'^\d{2}-\d{2}-\d{4}$',
+    r'^Age as on', r'^Date of Publication', r'^Assembly Constituency No and Name',
+    r'^Section No and Name', r'^Part No\.', r'^\d{2}-\d{2}-\d{4}$',
     r'^SUMMARY OF ELECTORS', r'^A\) NUMBER OF ELECTORS', r'^Roll Type',
     r'^Mother Roll$', r'^NUMBER OF ELECTORS$', r'^Signature of Electoral',
     r'^Draft Electoral Roll', r'^Male$', r'^Female$', r'^Third$', r'^Gender$',
     r'^Total$',
 ]
 ENGLISH_NOISE_RE = re.compile('|'.join(ENGLISH_NOISE_PATTERNS), re.IGNORECASE)
+
+# "Total Pages ... - Page N" marks a genuine page boundary in the source PDF
+# (unlike the other noise lines above, which interject mid-column between a
+# records-batch and its own matching IDs-batch and must NOT split them apart).
+# We use these to verify records/IDs counts stay balanced per page, so a
+# mismatch on one page is contained instead of silently shifting every
+# record after it for the rest of the document.
+ENGLISH_PAGE_BOUNDARY_RE = re.compile(r'^Total Pages', re.IGNORECASE)
 
 ENGLISH_ID_LETTER_RE = re.compile(r'^([A-Z]{2,4})\s?(\d{6,7})$')
 ENGLISH_ID_DIGIT_ONLY_RE = re.compile(r'^\d{6,7}$')
@@ -183,19 +253,45 @@ def clean_text_english_lines(text):
     for l in lines:
         if not l:
             continue
+        if ENGLISH_PAGE_BOUNDARY_RE.match(l):
+            out.append('\x00PAGE_BOUNDARY\x00')  # keep as a marker, strip everything else about the line
+            continue
         if ENGLISH_NOISE_RE.match(l):
             continue
         out.append(l)
     return out
+
+def split_into_english_pages(lines):
+    pages = []
+    current = []
+    for l in lines:
+        if l == '\x00PAGE_BOUNDARY\x00':
+            pages.append(current)
+            current = []
+            continue
+        current.append(l)
+    if current:
+        pages.append(current)
+    return pages
+
+def _looks_like_stray_id(line):
+    return bool(ENGLISH_ID_LETTER_RE.match(line) or ENGLISH_ID_DIGIT_ONLY_RE.match(line))
 
 def _parse_one_english_record(lines, i, serial, inferred=False):
     n = len(lines)
     name_line = lines[i]
     name = name_line.split(':', 1)[1].strip() if ':' in name_line else ''
     i += 1
-    # absorb wrapped continuation of name until relation label or House Number
+    stray_id_skipped = False
+    # absorb wrapped continuation of name until relation label or House Number,
+    # but skip (don't absorb) any stray Voter ID line that leaked in from a
+    # page-break splitting the record's own fields apart.
     while i < n and not re.match(r'(Fathers Name|Husbands Name|Mothers Name|Others)', lines[i], re.I) \
             and not lines[i].lower().startswith('house number'):
+        if _looks_like_stray_id(lines[i]):
+            stray_id_skipped = True
+            i += 1
+            continue
         name += ' ' + lines[i]
         i += 1
 
@@ -208,6 +304,10 @@ def _parse_one_english_record(lines, i, serial, inferred=False):
         relation = m.group(2).strip()
         i += 1
         while i < n and not lines[i].lower().startswith('house number'):
+            if _looks_like_stray_id(lines[i]):
+                stray_id_skipped = True
+                i += 1
+                continue
             relation += ' ' + lines[i]
             i += 1
 
@@ -234,7 +334,8 @@ def _parse_one_english_record(lines, i, serial, inferred=False):
         'House_No': house,
         'Age': age,
         'Gender': gender,
-        'Serial_Inferred': inferred
+        'Serial_Inferred': inferred,
+        'Stray_ID_Skipped': stray_id_skipped
     }
     return rec, i
 
@@ -280,34 +381,45 @@ def _extract_english_ids(lines):
 
 def parse_voter_data_english(text):
     lines = clean_text_english_lines(text)
-    records = _extract_english_records(lines)
-    ids = _extract_english_ids(lines)
+    pages = split_into_english_pages(lines)
 
     voters = []
     seen_ids = set()
-    for idx, rec in enumerate(records):
-        voter_id = ids[idx] if idx < len(ids) else ''
-        needs_review = False
-        if not voter_id:
-            needs_review = True
-        elif voter_id in seen_ids:
-            needs_review = True
-        else:
-            seen_ids.add(voter_id)
-        if rec.get('Serial_Inferred'):
-            needs_review = True
+    for page_lines in pages:
+        records = _extract_english_records(page_lines)
+        ids = _extract_english_ids(page_lines)
+        # If this page's records/IDs counts don't match, something on THIS page
+        # (a dropped record, a stray/missing ID) desynced the pairing - flag
+        # every record on this page rather than let a wrong guess ride, and
+        # contain the problem here instead of letting it shift every record
+        # on every later page too.
+        page_count_mismatch = (len(records) != len(ids))
 
-        voters.append({
-            'S.No': rec['S.No'],
-            'Voter_ID': voter_id,
-            'Voter_Name': rec['Voter_Name'],
-            'Father_Husband_Name': rec['Father_Husband_Name'],
-            'Relation_Type': rec.get('Relation_Type', ''),
-            'House_No': rec['House_No'],
-            'Age': rec['Age'],
-            'Gender': rec['Gender'],
-            'Needs_Review': 'Yes' if needs_review else ''
-        })
+        for idx, rec in enumerate(records):
+            voter_id = ids[idx] if idx < len(ids) else ''
+            needs_review = page_count_mismatch
+            if not voter_id:
+                needs_review = True
+            elif voter_id in seen_ids:
+                needs_review = True
+            else:
+                seen_ids.add(voter_id)
+            if rec.get('Serial_Inferred'):
+                needs_review = True
+            if rec.get('Stray_ID_Skipped'):
+                needs_review = True
+
+            voters.append({
+                'S.No': rec['S.No'],
+                'Voter_ID': voter_id,
+                'Voter_Name': rec['Voter_Name'],
+                'Father_Husband_Name': rec['Father_Husband_Name'],
+                'Relation_Type': rec.get('Relation_Type', ''),
+                'House_No': rec['House_No'],
+                'Age': rec['Age'],
+                'Gender': rec['Gender'],
+                'Needs_Review': 'Yes' if needs_review else ''
+            })
 
     return voters
 
